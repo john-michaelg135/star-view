@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Real-Time Constellation Map</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050508; font-family: 'Segoe UI', system-ui, sans-serif; color: white; }
+        canvas { display: block; }
+        
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 10; transition: opacity 0.3s;
+        }
+        
+        .hud-top {
+            position: absolute; top: 20px; left: 20px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+        }
+        .hud-top h1 { font-size: 1.2rem; margin: 0 0 5px 0; font-weight: 600; letter-spacing: 1px; color: #aaccff; }
+        .hud-top p { font-size: 0.8rem; margin: 0; opacity: 0.7; }
+
+        .controls {
+            position: absolute; bottom: 30px; right: 30px;
+            display: flex; gap: 10px; pointer-events: auto;
+        }
+
+        button {
+            background: rgba(20, 20, 30, 0.6); border: 1px solid rgba(255,255,255,0.2);
+            color: white; padding: 12px 20px; border-radius: 30px; cursor: pointer;
+            font-size: 0.9rem; backdrop-filter: blur(10px); transition: all 0.3s ease;
+            font-weight: 500; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        button:hover { background: rgba(255, 255, 255, 0.15); transform: translateY(-2px); }
+        button.active { background: rgba(74, 144, 226, 0.4); border-color: #4A90E2; box-shadow: 0 0 15px rgba(74, 144, 226, 0.4); }
+        button:disabled { opacity: 0.3; cursor: not-allowed; transform: none; }
+
+        #btn-exit-vr {
+            display: none;
+            position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+            z-index: 100; pointer-events: auto;
+            background: rgba(255, 50, 50, 0.8); border: 2px solid white;
+            padding: 10px 30px; font-weight: bold; letter-spacing: 1px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+        }
+        #btn-exit-vr:hover { background: rgba(255, 80, 80, 1); }
+
+        #overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle at center, #1a1a2e 0%, #000000 100%);
+            display: flex; align-items: center; justify-content: center;
+            flex-direction: column; z-index: 100; pointer-events: auto;
+        }
+        #overlay.hidden { display: none; }
+        #overlay h2 { margin-bottom: 10px; font-weight: 300; font-size: 1.8rem; letter-spacing: 2px; }
+        #overlay p { max-width: 400px; text-align: center; opacity: 0.7; margin-bottom: 30px; font-size: 0.9rem; line-height: 1.6; }
+        
+        .crosshair {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 4px; height: 4px; background: rgba(255,255,255,0.5); border-radius: 50%;
+            pointer-events: none; box-shadow: 0 0 10px 2px rgba(255,255,255,0.2);
+        }
+
+        body.vr-active #ui-layer, body.vr-active .crosshair { opacity: 0; pointer-events: none; }
+        body.vr-active #btn-exit-vr { display: block; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <div class="hud-top">
+            <h1>STELLAR NAVIGATOR</h1>
+            <p id="location-info">Acquiring GPS...</p>
+            <p id="status-info">Syncing Time...</p>
+        </div>
+        <div class="crosshair"></div>
+        <div class="controls">
+            <button id="btn-gyro" disabled>Gyroscope</button>
+            <button id="btn-lines" class="active">Constellations</button>
+            <button id="btn-vr" style="display:none;">Enter VR</button>
+        </div>
+    </div>
+
+    <button id="btn-exit-vr">EXIT VR</button>
+
+    <div id="overlay">
+        <h2>STELLAR NAVIGATOR</h2>
+        <p>Real-time astronomical tracking based on your exact GPS location and local time. Supports device tilting and stereoscopic Cardboard VR.</p>
+        <button id="btn-start">Initialize System</button>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- ASTRONOMY ENGINE ---
+        class AstroEngine {
+            static degToRad(deg) { return deg * (Math.PI / 180); }
+            static getJulianDate(date) { return (date.getTime() / 86400000.0) + 2440587.5; }
+            static getGMST(date) {
+                const jd = this.getJulianDate(date);
+                const t = (jd - 2451545.0) / 36525.0;
+                let gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * t * t - t * t * t / 38710000;
+                return ((gmst % 360) + 360) % 360;
+            }
+            static equatorialToVector3(ra, dec, radius = 500) {
+                const raRad = this.degToRad(ra);
+                const decRad = this.degToRad(dec);
+                return new THREE.Vector3(
+                    radius * Math.cos(decRad) * Math.cos(raRad),
+                    radius * Math.sin(decRad),
+                    -radius * Math.cos(decRad) * Math.sin(raRad)
+                );
+            }
+        }
+
+        // --- STAR DATA ---
+        const STAR_DATA = [
+            { name: "Betelgeuse", ra: 88.79, dec: 7.40, mag: 0.42, con: "Ori" },
+            { name: "Rigel", ra: 78.63, dec: -8.20, mag: 0.13, con: "Ori" },
+            { name: "Bellatrix", ra: 81.28, dec: 6.34, mag: 1.64, con: "Ori" },
+            { name: "Mintaka", ra: 83.00, dec: -0.30, mag: 2.23, con: "Ori" },
+            { name: "Alnilam", ra: 84.05, dec: -1.20, mag: 1.69, con: "Ori" },
+            { name: "Alnitak", ra: 85.18, dec: -1.94, mag: 1.77, con: "Ori" },
+            { name: "Saiph", ra: 86.93, dec: -9.66, mag: 2.06, con: "Ori" },
+            { name: "Pollux", ra: 116.32, dec: 28.02, mag: 1.14, con: "Gem" },
+            { name: "Castor", ra: 113.64, dec: 31.88, mag: 1.58, con: "Gem" },
+            { name: "Alhena", ra: 99.42, dec: 16.39, mag: 1.93, con: "Gem" },
+            { name: "Wasat", ra: 112.97, dec: 21.97, mag: 3.50, con: "Gem" },
+            { name: "Dubhe", ra: 165.93, dec: 61.75, mag: 1.79, con: "UMa" },
+            { name: "Merak", ra: 165.46, dec: 56.38, mag: 2.37, con: "UMa" },
+            { name: "Phecda", ra: 178.45, dec: 53.69, mag: 2.44, con: "UMa" },
+            { name: "Megrez", ra: 183.85, dec: 57.03, mag: 3.31, con: "UMa" },
+            { name: "Alioth", ra: 193.50, dec: 55.95, mag: 1.77, con: "UMa" },
+            { name: "Mizar", ra: 200.98, dec: 54.92, mag: 2.27, con: "UMa" },
+            { name: "Alkaid", ra: 206.88, dec: 49.31, mag: 1.86, con: "UMa" },
+            { name: "Schedar", ra: 10.12, dec: 56.53, mag: 2.23, con: "Cas" },
+            { name: "Caph", ra: 2.29, dec: 59.14, mag: 2.27, con: "Cas" },
+            { name: "Gamma Cas", ra: 14.17, dec: 60.71, mag: 2.47, con: "Cas" },
+            { name: "Ruchbah", ra: 21.44, dec: 60.23, mag: 2.68, con: "Cas" },
+            { name: "Segin", ra: 28.59, dec: 63.66, mag: 3.37, con: "Cas" },
+            { name: "Sirius", ra: 101.28, dec: -16.71, mag: -1.46, con: "CMa" },
+            { name: "Arcturus", ra: 213.91, dec: 19.18, mag: -0.04, con: "Boo" },
+            { name: "Vega", ra: 279.23, dec: 38.78, mag: 0.03, con: "Lyr" },
+            { name: "Capella", ra: 79.17, dec: 45.99, mag: 0.08, con: "Aur" },
+            { name: "Procyon", ra: 114.82, dec: 5.22, mag: 0.34, con: "CMi" },
+            { name: "Altair", ra: 297.69, dec: 8.86, mag: 0.76, con: "Aql" },
+            { name: "Aldebaran", ra: 68.98, dec: 16.50, mag: 0.86, con: "Tau" },
+            { name: "Spica", ra: 201.29, dec: -11.16, mag: 0.97, con: "Vir" },
+            { name: "Antares", ra: 247.35, dec: -26.43, mag: 1.04, con: "Sco" },
+            { name: "Fomalhaut", ra: 344.41, dec: -29.62, mag: 1.16, con: "PsA" },
+            { name: "Deneb", ra: 310.35, dec: 45.28, mag: 1.25, con: "Cyg" },
+            { name: "Regulus", ra: 152.09, dec: 11.96, mag: 1.40, con: "Leo" },
+            { name: "Polaris", ra: 37.95, dec: 89.26, mag: 1.98, con: "UMi" }
+        ];
+
+        const CONSTELLATIONS = {
+            "Ori": { name: "ORION", lines: [[0, 2], [2, 3], [3, 4], [4, 5], [5, 1], [0, 4], [1, 6]] },
+            "Gem": { name: "GEMINI", lines: [[7, 9], [8, 9], [9, 10]] },
+            "UMa": { name: "URSA MAJOR", lines: [[11, 12], [12, 13], [13, 14], [14, 15], [15, 16], [16, 17], [14, 11]] },
+            "Cas": { name: "CASSIOPEIA", lines: [[18, 19], [19, 20], [20, 21], [21, 22]] }
+        };
+
+        // --- CUSTOM CARDBOARD VR SHADER ---
+        const CardboardShader = {
+            uniforms: {
+                "tDiffuse": { value: null },
+                "distortion": { value: 0.6 },
+                "gap": { value: 0.03 }
+            },
+            vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                    vUv = uv;
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                uniform sampler2D tDiffuse;
+                uniform float distortion;
+                uniform float gap;
+                varying vec2 vUv;
+
+                vec2 distort(vec2 p) {
+                    float r2 = p.x * p.x + p.y * p.y;
+                    float f = 1.0 + r2 * (distortion + distortion * sqrt(r2));
+                    return f * p;
+                }
+
+                void main() {
+                    float eye = step(0.5, vUv.x);
+                    vec2 uv = vUv;
+                    uv.x = (uv.x - eye * 0.5) * 2.0; 
+                    
+                    uv.x = uv.x * (1.0 - gap) + (eye == 0.0 ? -gap/2.0 : gap/2.0);
+                    
+                    vec2 centered = uv - 0.5;
+                    vec2 distorted = distort(centered);
+                    vec2 finalUv = distorted + 0.5;
+
+                    vec2 maskUv = (finalUv - 0.5) * 2.0;
+                    float mask = 1.0 - smoothstep(0.75, 0.95, length(maskUv * vec2(1.0, 1.1)));
+                    
+                    if (finalUv.x < 0.0 || finalUv.x > 1.0 || finalUv.y < 0.0 || finalUv.y > 1.0 || mask < 0.01) {
+                        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                    } else {
+                        vec4 color = texture2D(tDiffuse, vec2((finalUv.x + eye) * 0.5, finalUv.y));
+                        float r = texture2D(tDiffuse, vec2((finalUv.x + eye) * 0.5 + 0.003, finalUv.y)).r;
+                        float b = texture2D(tDiffuse, vec2((finalUv.x + eye) * 0.5 - 0.003, finalUv.y)).b;
+                        gl_FragColor = vec4(r, color.g, b, 1.0) * mask;
+                    }
+                }
+            `
+        };
+
+        // --- MAIN APPLICATION ---
+        class StarMapApp {
+            constructor() {
+                this.scene = null;
+                this.camera = null; // Base camera for standard view
+                this.cameraL = null; // Left VR eye
+                this.cameraR = null; // Right VR eye
+                this.renderer = null;
+                
+                this.vrScene = new THREE.Scene();
+                this.vrCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+                this.vrMaterial = null;
+                this.renderTarget = null;
+                
+                this.lat = 0;
+                this.lon = 0;
+                
+                this.celestialSphere = new THREE.Group();
+                this.starsGroup = new THREE.Group();
+                this.linesGroup = new THREE.Group();
+                this.labelsGroup = new THREE.Group();
+                
+                this.isGyroEnabled = false;
+                this.isVRMode = false;
+                this.deviceOrientation = { alpha: 0, beta: 0, gamma: 0 };
+                
+                this.mouseX = 0;
+                this.mouseY = 0;
+                this.targetRotationX = 0;
+                this.targetRotationY = 0;
+
+                this.init();
+            }
+
+            async init() {
+                this.setupScene();
+                await this.getLocation();
+                
+                this.generateStars();
+                this.generateConstellations();
+                this.generateBackgroundStars();
+                
+                this.setupEvents();
+                this.checkVRSupport();
+                
+                this.animate();
+            }
+
+            setupScene() {
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x050508);
+                
+                // Standard Camera
+                this.camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2000);
+                
+                // VR Cameras (Stereoscopic pair)
+                this.cameraL = new THREE.PerspectiveCamera(70, (window.innerWidth / 2) / window.innerHeight, 0.1, 2000);
+                this.cameraR = new THREE.PerspectiveCamera(70, (window.innerWidth / 2) / window.innerHeight, 0.1, 2000);
+                
+                // IPD (Interpupillary Distance) offset
+                this.cameraL.position.set(-0.03, 0, 0); 
+                this.cameraR.position.set(0.03, 0, 0);
+
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                document.body.appendChild(this.renderer.domElement);
+
+                // VR Post-Processing Setup
+                this.renderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight);
+                this.vrMaterial = new THREE.ShaderMaterial({
+                    uniforms: THREE.UniformsUtils.clone(CardboardShader.uniforms),
+                    vertexShader: CardboardShader.vertexShader,
+                    fragmentShader: CardboardShader.fragmentShader
+                });
+                const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.vrMaterial);
+                this.vrScene.add(quad);
+
+                this.celestialSphere.add(this.starsGroup);
+                this.celestialSphere.add(this.linesGroup);
+                this.celestialSphere.add(this.labelsGroup);
+                this.scene.add(this.celestialSphere);
+            }
+
+            getLocation() {
+                return new Promise((resolve) => {
+                    if (!navigator.geolocation) {
+                        this.lat = 40.7128; this.lon = -74.0060; resolve(); return;
+                    }
+                    navigator.geolocation.getCurrentPosition(
+                        (pos) => {
+                            this.lat = pos.coords.latitude; this.lon = pos.coords.longitude;
+                            document.getElementById('location-info').innerText = `GPS: ${this.lat.toFixed(2)}°, ${this.lon.toFixed(2)}°`;
+                            resolve();
+                        },
+                        () => {
+                            this.lat = 40.7128; this.lon = -74.0060;
+                            document.getElementById('location-info').innerText = `GPS: Default (NYC)`;
+                            resolve();
+                        },
+                        { enableHighAccuracy: true, timeout: 5000 }
+                    );
+                });
+            }
+
+            generateStars() {
+                const positions = [], colors = [], sizes = [];
+                STAR_DATA.forEach(star => {
+                    const pos = AstroEngine.equatorialToVector3(star.ra, star.dec, 500);
+                    positions.push(pos.x, pos.y, pos.z);
+                    const c = new THREE.Color().setHSL(0.6, 0.2, 0.8 + (star.mag * 0.05));
+                    colors.push(c.r, c.g, c.b);
+                    sizes.push(Math.max(2.0, 10.0 - star.mag * 2.5));
+                });
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+
+                const material = new THREE.ShaderMaterial({
+                    vertexShader: `
+                        attribute float size; varying vec3 vColor;
+                        void main() {
+                            vColor = color;
+                            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                            gl_PointSize = size * (300.0 / -mvPosition.z);
+                            gl_Position = projectionMatrix * mvPosition;
+                        }`,
+                    fragmentShader: `
+                        varying vec3 vColor;
+                        void main() {
+                            float d = length(gl_PointCoord - vec2(0.5));
+                            if (d > 0.5) discard;
+                            float alpha = 1.0 - smoothstep(0.1, 0.5, d);
+                            gl_FragColor = vec4(vColor, alpha);
+                        }`,
+                    vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+                });
+                this.starsGroup.add(new THREE.Points(geometry, material));
+            }
+
+            generateConstellations() {
+                const lineMaterial = new THREE.LineBasicMaterial({ color: 0x4A90E2, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending });
+                Object.entries(CONSTELLATIONS).forEach(([key, con]) => {
+                    let centerVec = new THREE.Vector3(); let starCount = 0;
+                    con.lines.forEach(pair => {
+                        const s1 = STAR_DATA[pair[0]], s2 = STAR_DATA[pair[1]];
+                        const p1 = AstroEngine.equatorialToVector3(s1.ra, s1.dec, 498);
+                        const p2 = AstroEngine.equatorialToVector3(s2.ra, s2.dec, 498);
+                        this.linesGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([p1, p2]), lineMaterial));
+                        centerVec.add(p1); centerVec.add(p2); starCount += 2;
+                    });
+
+                    if (starCount > 0) {
+                        centerVec.divideScalar(starCount).normalize().multiplyScalar(480);
+                        const canvas = document.createElement('canvas');
+                        const ctx = canvas.getContext('2d');
+                        canvas.width = 256; canvas.height = 64;
+                        ctx.font = "bold 32px Arial"; ctx.fillStyle = "rgba(150, 200, 255, 1.0)";
+                        ctx.textAlign = "center"; ctx.fillText(con.name, 128, 42);
+                        
+                        const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true, depthTest: false }));
+                        sprite.position.copy(centerVec); 
+                        sprite.scale.set(50, 12.5, 1);
+                        sprite.material.opacity = 0;
+                        this.labelsGroup.add(sprite);
+                    }
+                });
+            }
+
+            generateBackgroundStars() {
+                const bgGeo = new THREE.BufferGeometry(); const bgPos = [];
+                for(let i=0; i<4000; i++) {
+                    const theta = Math.random() * Math.PI * 2, phi = Math.acos((Math.random() * 2) - 1), r = 800 + Math.random() * 200;
+                    bgPos.push(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi));
+                }
+                bgGeo.setAttribute('position', new THREE.Float32BufferAttribute(bgPos, 3));
+                this.scene.add(new THREE.Points(bgGeo, new THREE.PointsMaterial({ color: 0x8888aa, size: 1.5, transparent: true, opacity: 0.6 })));
+            }
+
+            setupEvents() {
+                window.addEventListener('resize', () => {
+                    this.camera.aspect = window.innerWidth / window.innerHeight;
+                    this.camera.updateProjectionMatrix();
+                    
+                    this.cameraL.aspect = (window.innerWidth / 2) / window.innerHeight;
+                    this.cameraL.updateProjectionMatrix();
+                    this.cameraR.aspect = (window.innerWidth / 2) / window.innerHeight;
+                    this.cameraR.updateProjectionMatrix();
+
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                    this.renderTarget.setSize(window.innerWidth, window.innerHeight);
+                });
+
+                window.addEventListener('mousemove', (e) => {
+                    if (this.isGyroEnabled || this.isVRMode) return;
+                    this.mouseX = (e.clientX / window.innerWidth) * 2 - 1;
+                    this.mouseY = (e.clientY / window.innerHeight) * 2 - 1;
+                });
+
+                document.getElementById('btn-start').addEventListener('click', () => {
+                    document.getElementById('overlay').classList.add('hidden');
+                    this.requestGyro();
+                });
+
+                document.getElementById('btn-gyro').addEventListener('click', () => {
+                    if (this.isGyroEnabled) {
+                        this.isGyroEnabled = false;
+                        document.getElementById('btn-gyro').classList.remove('active');
+                        document.getElementById('btn-gyro').innerText = "Gyroscope";
+                    } else { this.requestGyro(); }
+                });
+
+                document.getElementById('btn-lines').addEventListener('click', (e) => {
+                    const isVisible = !this.linesGroup.visible;
+                    this.linesGroup.visible = isVisible; 
+                    if(!isVisible) this.labelsGroup.visible = false;
+                    e.target.classList.toggle('active');
+                });
+
+                const toggleVR = () => {
+                    this.isVRMode = !this.isVRMode;
+                    if (this.isVRMode) {
+                        document.body.classList.add('vr-active');
+                        if (screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(()=>{});
+                    } else {
+                        document.body.classList.remove('vr-active');
+                        if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock();
+                    }
+                };
+
+                document.getElementById('btn-vr').addEventListener('click', toggleVR);
+                document.getElementById('btn-exit-vr').addEventListener('click', toggleVR);
+
+                window.addEventListener('deviceorientation', (e) => {
+                    if (!this.isGyroEnabled) return;
+                    this.deviceOrientation.alpha = e.alpha || 0;
+                    this.deviceOrientation.beta = e.beta || 0;
+                    this.deviceOrientation.gamma = e.gamma || 0;
+                });
+            }
+
+            requestGyro() {
+                if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    DeviceOrientationEvent.requestPermission().then(state => { if (state === 'granted') this.enableGyro(); }).catch(console.error);
+                } else { this.enableGyro(); }
+            }
+
+            enableGyro() {
+                this.isGyroEnabled = true;
+                document.getElementById('btn-gyro').classList.add('active');
+                document.getElementById('btn-gyro').innerText = "Gyro Active";
+                document.getElementById('btn-gyro').disabled = false;
+            }
+
+            checkVRSupport() {
+                const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                if (isMobile || ('xr' in navigator)) document.getElementById('btn-vr').style.display = 'block';
+            }
+
+            updateGyro() {
+                if (!this.isGyroEnabled) return;
+
+                const alpha = THREE.MathUtils.degToRad(this.deviceOrientation.alpha);
+                const beta = THREE.MathUtils.degToRad(this.deviceOrientation.beta);
+                const gamma = THREE.MathUtils.degToRad(this.deviceOrientation.gamma);
+
+                // Determine screen orientation angle
+                let orientAngle = 0;
+                if (screen.orientation && screen.orientation.angle !== undefined) {
+                    orientAngle = THREE.MathUtils.degToRad(screen.orientation.angle);
+                } else if (window.orientation !== undefined) {
+                    orientAngle = THREE.MathUtils.degToRad(window.orientation);
+                }
+
+                // Standard Euler mapping
+                const euler = new THREE.Euler(beta, alpha, -gamma, 'YXZ');
+                const quat = new THREE.Quaternion().setFromEuler(euler);
+
+                // Compensate for screen rotation (Portrait vs Landscape)
+                const q1 = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -orientAngle);
+                const q2 = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+                
+                quat.multiply(q1).multiply(q2);
+
+                // Apply to all cameras
+                this.camera.quaternion.copy(quat);
+                this.cameraL.quaternion.copy(quat);
+                this.cameraR.quaternion.copy(quat);
+            }
+
+            updateSkyAndLabels() {
+                const now = new Date();
+                document.getElementById('status-info').innerText = `Time: ${now.toLocaleTimeString()}`;
+                const lst = (AstroEngine.getGMST(now) + this.lon) % 360;
+
+                // Rotate Sky
+                this.celestialSphere.rotation.set(0, 0, 0);
+                this.celestialSphere.rotateOnWorldAxis(new THREE.Vector3(0, 1, 0), AstroEngine.degToRad(-lst));
+                this.celestialSphere.rotateOnWorldAxis(new THREE.Vector3(1, 0, 0), AstroEngine.degToRad(this.lat - 90));
+
+                // Update Camera Rotation
+                if (this.isGyroEnabled) {
+                    this.updateGyro();
+                } else if (!this.isVRMode) {
+                    // Mouse fallback
+                    this.targetRotationX += (this.mouseX * Math.PI - this.targetRotationX) * 0.05;
+                    this.targetRotationY += (-this.mouseY * Math.PI/2 - this.targetRotationY) * 0.05;
+                    this.camera.rotation.y = this.targetRotationX;
+                    this.camera.rotation.x = this.targetRotationY;
+                    this.cameraL.rotation.copy(this.camera.rotation);
+                    this.cameraR.rotation.copy(this.camera.rotation);
+                }
+
+                // Ensure matrices are updated for label math
+                this.camera.updateMatrixWorld();
+                const cameraForward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+
+                // Update Labels (Center Focus Logic)
+                if (this.labelsGroup.visible) {
+                    this.labelsGroup.children.forEach(sprite => {
+                        const worldPos = new THREE.Vector3();
+                        sprite.getWorldPosition(worldPos);
+                        
+                        if (worldPos.y < 0) {
+                            sprite.material.opacity = 0;
+                            return;
+                        }
+
+                        const dirToLabel = worldPos.clone().normalize();
+                        const angle = dirToLabel.angleTo(cameraForward);
+                        const maxAngle = THREE.MathUtils.degToRad(35);
+                        
+                        if (angle < maxAngle) {
+                            const targetOpacity = 1.0 - (angle / maxAngle);
+                            sprite.material.opacity += (targetOpacity - sprite.material.opacity) * 0.1;
+                        } else {
+                            sprite.material.opacity += (0 - sprite.material.opacity) * 0.1;
+                        }
+                    });
+                }
+            }
+
+            animate() {
+                requestAnimationFrame(this.animate.bind(this));
+                this.updateSkyAndLabels();
+
+                if (this.isVRMode) {
+                    // --- STEREOSCOPIC VR RENDERING (FIXED) ---
+                    const width = window.innerWidth;
+                    const height = window.innerHeight;
+                    
+                    // Render Left Eye to left half of render target
+                    this.renderer.setViewport(0, 0, width / 2, height);
+                    this.renderer.setScissor(0, 0, width / 2, height);
+                    this.renderer.setScissorTest(true);
+                    this.renderer.setRenderTarget(this.renderTarget);
+                    this.renderer.render(this.scene, this.cameraL);
+
+                    // Render Right Eye to right half of render target
+                    this.renderer.setViewport(width / 2, 0, width / 2, height);
+                    this.renderer.setScissor(width / 2, 0, width / 2, height);
+                    this.renderer.render(this.scene, this.cameraR);
+                    
+                    // Reset scissor/viewport
+                    this.renderer.setScissorTest(false);
+                    this.renderer.setViewport(0, 0, width, height);
+
+                    // Apply Cardboard Shader to the combined render target
+                    this.vrMaterial.uniforms.tDiffuse.value = this.renderTarget.texture;
+                    this.renderer.setRenderTarget(null);
+                    this.renderer.render(this.vrScene, this.vrCamera);
+                } else {
+                    // --- STANDARD RENDERING ---
+                    this.renderer.setRenderTarget(null);
+                    this.renderer.render(this.scene, this.camera);
+                }
+            }
+        }
+
+        window.onload = () => { new StarMapApp(); };
+    </script>
+</body>
+</html>
